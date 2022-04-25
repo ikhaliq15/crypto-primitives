@@ -3,6 +3,7 @@ pub mod constraints;
 #[cfg(feature = "r1cs")]
 pub use constraints::*;
 
+pub mod aes;
 pub mod elgamal;
 
 use crate::Error;
@@ -33,6 +34,35 @@ pub trait AsymmetricEncryptionScheme {
     fn decrypt(
         pp: &Self::Parameters,
         sk: &Self::SecretKey,
+        ciphertext: &Self::Ciphertext,
+    ) -> Result<Self::Plaintext, Error>;
+}
+
+
+pub trait SymmetricEncryptionScheme {
+    type Parameters;
+    type Key;
+    type Randomness;
+    type Plaintext;
+    type Ciphertext;
+
+    fn setup<R: Rng>(rng: &mut R) -> Result<Self::Parameters, Error>;
+
+    fn keygen<R: Rng>(
+        pp: &Self::Parameters,
+        rng: &mut R,
+    ) -> Result<Self::Key, Error>;
+
+    fn encrypt(
+        pp: &Self::Parameters,
+        pk: &Self::Key,
+        message: &Self::Plaintext,
+        r: &Self::Randomness,
+    ) -> Result<Self::Ciphertext, Error>;
+
+    fn decrypt(
+        pp: &Self::Parameters,
+        sk: &Self::Key,
         ciphertext: &Self::Ciphertext,
     ) -> Result<Self::Plaintext, Error>;
 }
