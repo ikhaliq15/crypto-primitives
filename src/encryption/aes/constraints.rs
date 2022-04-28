@@ -1,17 +1,14 @@
-// TODO: add credits/sources.
-
 use std::borrow::Borrow;
-use std::iter;
 use std::marker::PhantomData;
 use ark_ff::{PrimeField};
-use ark_r1cs_std::{ToBitsGadget, ToBytesGadget};
+use ark_r1cs_std::{R1CSVar};
 use ark_r1cs_std::alloc::{AllocationMode, AllocVar};
 use ark_r1cs_std::boolean::Boolean;
 use ark_r1cs_std::eq::EqGadget;
 use ark_r1cs_std::uint64::UInt64;
 use ark_r1cs_std::uint8::UInt8;
 use ark_relations::r1cs::{Namespace, SynthesisError};
-use crate::encryption::aes::{Aes128, Ciphertext, Key, Parameters, Plaintext, r1cs_utils::UInt64Ext, Randomness};
+use crate::encryption::aes::{Aes128, Ciphertext, Key, Parameters, Plaintext, Randomness};
 use crate::encryption::SymmetricEncryptionGadget;
 
 pub type AesState<ConstraintF> = [UInt64<ConstraintF>; 8];
@@ -22,661 +19,237 @@ pub struct Aes128Gadget<ConstraintF: PrimeField> {
     t: UInt8<ConstraintF>
 }
 
-macro_rules! define_mix_columns {
-    (
-        $name:ident,
-        $first_rotate:path,
-        $second_rotate:path,
-        $state_type:path,
-    ) => {
-        #[rustfmt::skip]
-        fn $name(state: &mut $state_type) {
-            let (a0, a1, a2, a3, a4, a5, a6, a7) = (
-                state[0].clone(), state[1].clone(), state[2].clone(), state[3].clone(), state[4].clone(), state[5].clone(), state[6].clone(), state[7].clone()
-            );
-            let (b0, b1, b2, b3, b4, b5, b6, b7) = (
-                $first_rotate(a0.clone()),
-                $first_rotate(a1.clone()),
-                $first_rotate(a2.clone()),
-                $first_rotate(a3.clone()),
-                $first_rotate(a4.clone()),
-                $first_rotate(a5.clone()),
-                $first_rotate(a6.clone()),
-                $first_rotate(a7.clone()),
-            );
-            let (c0, c1, c2, c3, c4, c5, c6, c7) = (
-                a0.xor(&b0).unwrap(),
-                a1.xor(&b1).unwrap(),
-                a2.xor(&b2).unwrap(),
-                a3.xor(&b3).unwrap(),
-                a4.xor(&b4).unwrap(),
-                a5.xor(&b5).unwrap(),
-                a6.xor(&b6).unwrap(),
-                a7.xor(&b7).unwrap(),
-            );
-            state[0] = b0                      .xor(&c7).unwrap()  .xor(&$second_rotate(c0.clone())).unwrap();
-            state[1] = b1  .xor(&c0).unwrap()  .xor(&c7).unwrap()  .xor(&$second_rotate(c1.clone())).unwrap();
-            state[2] = b2  .xor(&c1).unwrap()                      .xor(&$second_rotate(c2.clone())).unwrap();
-            state[3] = b3  .xor(&c2).unwrap()  .xor(&c7).unwrap()  .xor(&$second_rotate(c3.clone())).unwrap();
-            state[4] = b4  .xor(&c3).unwrap()  .xor(&c7).unwrap()  .xor(&$second_rotate(c4.clone())).unwrap();
-            state[5] = b5  .xor(&c4).unwrap()                      .xor(&$second_rotate(c5.clone())).unwrap();
-            state[6] = b6  .xor(&c5).unwrap()                      .xor(&$second_rotate(c6.clone())).unwrap();
-            state[7] = b7  .xor(&c6).unwrap()                      .xor(&$second_rotate(c7.clone())).unwrap();
-        }
-    }
-}
+// Round constants helper table for AES-128.
+// Source: FIPS-197, https://csrc.nist.gov/csrc/media/publications/fips/197/final/documents/fips-197.pdf
+const RCON: [u8; 10] = [ 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36 ];
 
-#[allow(dead_code)]
+// SBOX helper table for AES.
+// Source: https://github.com/yahu/AES/blob/master/SBOX.txt
+const SBOX: [u8; 256] =
+    [
+        0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30, 0x1,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+        0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+        0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+        0x4,0xc7,0x23,0xc3,0x18,0x96, 0x5,0x9a, 0x7,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+        0x9,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+        0x53,0xd1,   0,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+        0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9, 0x2,0x7f,0x50,0x3c,0x9f,0xa8,
+        0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+        0xcd, 0xc,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+        0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e, 0xb,0xdb,
+        0xe0,0x32,0x3a, 0xa,0x49, 0x6,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+        0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae, 0x8,
+        0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+        0x70,0x3e,0xb5,0x66,0x48, 0x3,0xf6, 0xe,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+        0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+        0x8c,0xa1,0x89, 0xd,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d, 0xf,0xb0,0x54,0xbb,0x16,
+    ];
+
+// Multiplication look-up tables.
+// Source: https://github.com/devershichandra27/C-implementation-of-AES/blob/master/AES.c
+const MUL2: [u8; 256] = [
+    0x00,0x02,0x04,0x06,0x08,0x0a,0x0c,0x0e,0x10,0x12,0x14,0x16,0x18,0x1a,0x1c,0x1e,
+    0x20,0x22,0x24,0x26,0x28,0x2a,0x2c,0x2e,0x30,0x32,0x34,0x36,0x38,0x3a,0x3c,0x3e,
+    0x40,0x42,0x44,0x46,0x48,0x4a,0x4c,0x4e,0x50,0x52,0x54,0x56,0x58,0x5a,0x5c,0x5e,
+    0x60,0x62,0x64,0x66,0x68,0x6a,0x6c,0x6e,0x70,0x72,0x74,0x76,0x78,0x7a,0x7c,0x7e,
+    0x80,0x82,0x84,0x86,0x88,0x8a,0x8c,0x8e,0x90,0x92,0x94,0x96,0x98,0x9a,0x9c,0x9e,
+    0xa0,0xa2,0xa4,0xa6,0xa8,0xaa,0xac,0xae,0xb0,0xb2,0xb4,0xb6,0xb8,0xba,0xbc,0xbe,
+    0xc0,0xc2,0xc4,0xc6,0xc8,0xca,0xcc,0xce,0xd0,0xd2,0xd4,0xd6,0xd8,0xda,0xdc,0xde,
+    0xe0,0xe2,0xe4,0xe6,0xe8,0xea,0xec,0xee,0xf0,0xf2,0xf4,0xf6,0xf8,0xfa,0xfc,0xfe,
+    0x1b,0x19,0x1f,0x1d,0x13,0x11,0x17,0x15,0x0b,0x09,0x0f,0x0d,0x03,0x01,0x07,0x05,
+    0x3b,0x39,0x3f,0x3d,0x33,0x31,0x37,0x35,0x2b,0x29,0x2f,0x2d,0x23,0x21,0x27,0x25,
+    0x5b,0x59,0x5f,0x5d,0x53,0x51,0x57,0x55,0x4b,0x49,0x4f,0x4d,0x43,0x41,0x47,0x45,
+    0x7b,0x79,0x7f,0x7d,0x73,0x71,0x77,0x75,0x6b,0x69,0x6f,0x6d,0x63,0x61,0x67,0x65,
+    0x9b,0x99,0x9f,0x9d,0x93,0x91,0x97,0x95,0x8b,0x89,0x8f,0x8d,0x83,0x81,0x87,0x85,
+    0xbb,0xb9,0xbf,0xbd,0xb3,0xb1,0xb7,0xb5,0xab,0xa9,0xaf,0xad,0xa3,0xa1,0xa7,0xa5,
+    0xdb,0xd9,0xdf,0xdd,0xd3,0xd1,0xd7,0xd5,0xcb,0xc9,0xcf,0xcd,0xc3,0xc1,0xc7,0xc5,
+    0xfb,0xf9,0xff,0xfd,0xf3,0xf1,0xf7,0xf5,0xeb,0xe9,0xef,0xed,0xe3,0xe1,0xe7,0xe5,
+];
+
+const MUL3: [u8; 256] = [
+    0x00,0x03,0x06,0x05,0x0c,0x0f,0x0a,0x09,0x18,0x1b,0x1e,0x1d,0x14,0x17,0x12,0x11,
+    0x30,0x33,0x36,0x35,0x3c,0x3f,0x3a,0x39,0x28,0x2b,0x2e,0x2d,0x24,0x27,0x22,0x21,
+    0x60,0x63,0x66,0x65,0x6c,0x6f,0x6a,0x69,0x78,0x7b,0x7e,0x7d,0x74,0x77,0x72,0x71,
+    0x50,0x53,0x56,0x55,0x5c,0x5f,0x5a,0x59,0x48,0x4b,0x4e,0x4d,0x44,0x47,0x42,0x41,
+    0xc0,0xc3,0xc6,0xc5,0xcc,0xcf,0xca,0xc9,0xd8,0xdb,0xde,0xdd,0xd4,0xd7,0xd2,0xd1,
+    0xf0,0xf3,0xf6,0xf5,0xfc,0xff,0xfa,0xf9,0xe8,0xeb,0xee,0xed,0xe4,0xe7,0xe2,0xe1,
+    0xa0,0xa3,0xa6,0xa5,0xac,0xaf,0xaa,0xa9,0xb8,0xbb,0xbe,0xbd,0xb4,0xb7,0xb2,0xb1,
+    0x90,0x93,0x96,0x95,0x9c,0x9f,0x9a,0x99,0x88,0x8b,0x8e,0x8d,0x84,0x87,0x82,0x81,
+    0x9b,0x98,0x9d,0x9e,0x97,0x94,0x91,0x92,0x83,0x80,0x85,0x86,0x8f,0x8c,0x89,0x8a,
+    0xab,0xa8,0xad,0xae,0xa7,0xa4,0xa1,0xa2,0xb3,0xb0,0xb5,0xb6,0xbf,0xbc,0xb9,0xba,
+    0xfb,0xf8,0xfd,0xfe,0xf7,0xf4,0xf1,0xf2,0xe3,0xe0,0xe5,0xe6,0xef,0xec,0xe9,0xea,
+    0xcb,0xc8,0xcd,0xce,0xc7,0xc4,0xc1,0xc2,0xd3,0xd0,0xd5,0xd6,0xdf,0xdc,0xd9,0xda,
+    0x5b,0x58,0x5d,0x5e,0x57,0x54,0x51,0x52,0x43,0x40,0x45,0x46,0x4f,0x4c,0x49,0x4a,
+    0x6b,0x68,0x6d,0x6e,0x67,0x64,0x61,0x62,0x73,0x70,0x75,0x76,0x7f,0x7c,0x79,0x7a,
+    0x3b,0x38,0x3d,0x3e,0x37,0x34,0x31,0x32,0x23,0x20,0x25,0x26,0x2f,0x2c,0x29,0x2a,
+    0x0b,0x08,0x0d,0x0e,0x07,0x04,0x01,0x02,0x13,0x10,0x15,0x16,0x1f,0x1c,0x19,0x1a,
+];
+
+// constants for AES-128
+// TODO: move these constants somewhere else
+const NK: usize = 4;
+const NB: usize = 4;
+const NR: usize = 10;
+
 impl<ConstraintF: PrimeField> Aes128Gadget<ConstraintF> {
-    /// Fully bitsliced AES-128 key schedule to match the fully-fixsliced representation.
-    #[allow(unused_variables, unused_mut)]
-    pub fn aes128_key_schedule(key: [UInt8<ConstraintF>; 16]) -> Vec<UInt64<ConstraintF>> {
-        let mut rkeys: Vec<UInt64<_>> = std::iter::repeat_with(|| UInt64::constant(0u64)).take(88).collect();
-        // let mut rkeys = [0u64; 88].map(UInt64::constant);
 
-        Self::bitslice(&mut rkeys[..8], &key, &key, &key, &key);
+    fn sub_byte(byte: UInt8<ConstraintF>) -> UInt8<ConstraintF> {
+        UInt8::constant(SBOX[byte.value().unwrap() as usize])
+    }
 
-        let mut rk_off = 0;
-        for rcon in 0..10 {
-            Self::memshift32(&mut rkeys, rk_off);
-            rk_off += 8;
+    // TODO: rename the key_schedule and encrypt functions to something similar to FIPS-197 names.
+    // TODO: key scheduler and encrypt have bad rust idioms, i think. probably shouldn't need use .clone so much :\
 
-            Self::sub_bytes(&mut rkeys[rk_off..(rk_off + 8)]);
-            Self::sub_bytes_nots(&mut rkeys[rk_off..(rk_off + 8)]);
+    // uses Figure 11 in Section 5.2 of https://csrc.nist.gov/csrc/media/publications/fips/197/final/documents/fips-197.pdf
+    pub fn aes128_key_schedule(key: [UInt8<ConstraintF>; 16]) -> [[UInt8<ConstraintF>; 4]; NB * (NR + 1)] {
+        // helper functions
+        // TODO: see if i get rid of these nested functions and move them out of aes128_key_schedule
+        fn rcon<ConstraintF: PrimeField>(i: usize) -> [UInt8<ConstraintF>; 4] {
+            [
+                UInt8::constant(RCON[i-1]),
+                UInt8::constant(0u8),
+                UInt8::constant(0u8),
+                UInt8::constant(0u8),
+            ]
+        }
 
-            if rcon < 8 {
-                Self::add_round_constant_bit(&mut rkeys[rk_off..(rk_off + 8)], rcon);
-            } else {
-                Self::add_round_constant_bit(&mut rkeys[rk_off..(rk_off + 8)], rcon - 8);
-                Self::add_round_constant_bit(&mut rkeys[rk_off..(rk_off + 8)], rcon - 7);
-                Self::add_round_constant_bit(&mut rkeys[rk_off..(rk_off + 8)], rcon - 5);
-                Self::add_round_constant_bit(&mut rkeys[rk_off..(rk_off + 8)], rcon - 4);
+        fn xor_words<ConstraintF: PrimeField>(
+            a: [UInt8<ConstraintF>; 4],
+            b: [UInt8<ConstraintF>; 4]
+        ) -> [UInt8<ConstraintF>; 4] {
+            [
+                a[0].xor(&b[0]).unwrap(),
+                a[1].xor(&b[1]).unwrap(),
+                a[2].xor(&b[2]).unwrap(),
+                a[3].xor(&b[3]).unwrap(),
+            ]
+        }
+
+        fn rot_word<ConstraintF: PrimeField>(word: [UInt8<ConstraintF>; 4]) -> [UInt8<ConstraintF>; 4] {
+            [word[1].clone(), word[2].clone(), word[3].clone(), word[0].clone()]
+        }
+
+        fn sub_word<ConstraintF: PrimeField>(word: [UInt8<ConstraintF>; 4]) -> [UInt8<ConstraintF>; 4] {
+            word.map(|byte: UInt8<ConstraintF>| Aes128Gadget::sub_byte(byte))
+        }
+
+        let mut w: [[UInt8<ConstraintF>; 4]; NB * (NR + 1)] =
+            [(); NB * (NR + 1)].map(|_| [
+                UInt8::constant(0u8),
+                UInt8::constant(0u8),
+                UInt8::constant(0u8),
+                UInt8::constant(0u8),
+            ]);
+
+        let mut i: usize = 0;
+
+        while i < NK {
+            w[i] = [key[4*i].clone(), key[4*i+1].clone(), key[4*i+2].clone(), key[4*i+3].clone()];
+            i += 1;
+        }
+
+        i = NK;
+
+        while i < NB * (NR +1) {
+            let mut temp: [UInt8<ConstraintF>; 4] = w[i-1].clone();
+
+            if i % NK == 0 {
+                temp = xor_words(sub_word(rot_word(temp)), rcon(i/NK));
+            } else if NK > 6 && i % NK == 4 {
+                temp = sub_word(temp);
             }
 
-            Self::xor_columns(&mut rkeys, rk_off, 8, Self::ror_distance(1, 3));
+            w[i] = xor_words(w[i-NK].clone(), temp);
+
+            i += 1;
         }
 
-        // Adjust to match fixslicing format
-        #[cfg(feature = "compact")]
-        {
-            for i in (8..88).step_by(16) {
-                inv_shift_rows_1(&mut rkeys[i..(i + 8)]);
-            }
-        }
-        #[cfg(not(feature = "compact"))]
-        {
-            for i in (8..72).step_by(32) {
-                Self::inv_shift_rows_1(&mut rkeys[i..(i + 8)]);
-                Self::inv_shift_rows_2(&mut rkeys[(i + 8)..(i + 16)]);
-                Self::inv_shift_rows_3(&mut rkeys[(i + 16)..(i + 24)]);
-            }
-            Self::inv_shift_rows_1(&mut rkeys[72..80]);
-        }
-
-        // Account for NOTs removed from sub_bytes
-        for i in 1..11 {
-            Self::sub_bytes_nots(&mut rkeys[(i * 8)..(i * 8 + 8)]);
-        }
-
-        rkeys
+        w
     }
 
-    pub fn aes128_encrypt(rkeys: &Vec<UInt64<ConstraintF>>, blocks: &mut [[UInt8<ConstraintF>; 16]]) {
-        debug_assert_eq!(rkeys.len(), 88);
-        debug_assert_eq!(blocks.len(), 4);
-        let mut state: AesState<ConstraintF> = [0u64; 8].map(UInt64::constant);
+    // uses Figure 5 in Section 5.1 of https://csrc.nist.gov/csrc/media/publications/fips/197/final/documents/fips-197.pdf
+    pub fn aes128_encrypt(
+        input: [UInt8<ConstraintF>; 4 * NB],
+        rkeys: [[UInt8<ConstraintF>; 4]; NB * (NR + 1)]
+    ) -> [UInt8<ConstraintF>; 4 * NB] {
+        // helper functions
+        // TODO: see if i get rid of these nested functions and move them out of aes128_key_schedule
+        fn add_round_key<ConstraintF: PrimeField>(
+            state: [UInt8<ConstraintF>; 4 * NB],
+            rkey: &[[UInt8<ConstraintF>; 4]]
+        ) -> [UInt8<ConstraintF>; 4 * NB] {
+            assert_eq!(rkey.len(), NB);
 
-        Self::bitslice(&mut state, &blocks[0], &blocks[1], &blocks[2], &blocks[3]);
-
-        Self::add_round_key(&mut state, &rkeys[..8]);
-
-        let mut rk_off = 8;
-        loop {
-            Self::sub_bytes(&mut state);
-            Self::mix_columns_1(&mut state);
-            Self::add_round_key(&mut state, &rkeys[rk_off..(rk_off + 8)]);
-            rk_off += 8;
-
-            if rk_off == 80 {
-                break;
+            let mut out: [UInt8<ConstraintF>; 4 * NB] = state.clone();
+            for row in 0..4 {
+                for col in 0..NB {
+                    let ind = row * NB + col;
+                    out[ind] = out[ind].xor(&rkey[row][col]).unwrap();
+                }
             }
 
-            #[cfg(not(feature = "compact"))]
-            {
-                Self::sub_bytes(&mut state);
-                Self::mix_columns_2(&mut state);
-                Self::add_round_key(&mut state, &rkeys[rk_off..(rk_off + 8)]);
-                rk_off += 8;
+            out
+        }
 
-                Self::sub_bytes(&mut state);
-                Self::mix_columns_3(&mut state);
-                Self::add_round_key(&mut state, &rkeys[rk_off..(rk_off + 8)]);
-                rk_off += 8;
+        fn sub_bytes<ConstraintF: PrimeField>(
+            state: [UInt8<ConstraintF>; 4 * NB]
+        ) -> [UInt8<ConstraintF>; 4 * NB] {
+            state.map(|byte: UInt8<ConstraintF>| Aes128Gadget::sub_byte(byte))
+        }
+
+        fn shift_rows<ConstraintF: PrimeField>(
+            state: [UInt8<ConstraintF>; 4 * NB]
+        ) -> [UInt8<ConstraintF>; 4 * NB] {
+            [0, 5, 10, 15, 4, 9, 14, 3, 8, 13, 2, 7, 12, 1, 6, 11].map(|ind| state[ind].clone())
+        }
+
+        fn mix_columns<ConstraintF: PrimeField>(
+            state: [UInt8<ConstraintF>; 4 * NB]
+        ) -> [UInt8<ConstraintF>; 4 * NB] {
+            let mut out = state.clone();
+            for row in 0..NB {
+                let s0 = state[4 * row].value().unwrap() as usize;
+                let s1 = state[4 * row + 1].value().unwrap() as usize;
+                let s2 = state[4 * row + 2].value().unwrap() as usize;
+                let s3 = state[4 * row + 3].value().unwrap() as usize;
+
+                out[4 * row] = UInt8::constant(MUL2[s0])
+                    .xor(&UInt8::constant(MUL3[s1])).unwrap()
+                    .xor(&UInt8::constant(s2 as u8)).unwrap()
+                    .xor(&UInt8::constant(s3 as u8)).unwrap();
+                out[4 * row + 1] = UInt8::constant(s0 as u8)
+                    .xor(&UInt8::constant(MUL2[s1])).unwrap()
+                    .xor(&UInt8::constant(MUL3[s2])).unwrap()
+                    .xor(&UInt8::constant(s3 as u8)).unwrap();
+                out[4 * row + 2] = UInt8::constant(s0 as u8)
+                    .xor(&UInt8::constant(s1 as u8)).unwrap()
+                    .xor(&UInt8::constant(MUL2[s2])).unwrap()
+                    .xor(&UInt8::constant(MUL3[s3])).unwrap();
+                out[4 * row + 3] = UInt8::constant(MUL3[s0])
+                    .xor(&UInt8::constant(s1 as u8)).unwrap()
+                    .xor(&UInt8::constant(s2 as u8)).unwrap()
+                    .xor(&UInt8::constant(MUL2[s3])).unwrap();
             }
-
-            Self::sub_bytes(&mut state);
-            Self::mix_columns_0(&mut state);
-            Self::add_round_key(&mut state, &rkeys[rk_off..(rk_off + 8)]);
-            rk_off += 8;
+            out
         }
 
-        #[cfg(not(feature = "compact"))]
-        {
-            Self::shift_rows_2(&mut state);
+        let mut state: [UInt8<ConstraintF>; 4 * NB] = input.clone();
+
+        state = add_round_key(state.clone(), &rkeys[0..NB]);
+
+        for round in 1..NR {
+            state = sub_bytes(state.clone());
+            state = shift_rows(state.clone());
+            state = mix_columns(state.clone());
+            state = add_round_key(state.clone(), &rkeys[round*NB..(round+1)*NB]);
         }
 
-        Self::sub_bytes(&mut state);
-        Self::add_round_key(&mut state, &rkeys[80..]);
+        state = sub_bytes(state.clone());
+        state = shift_rows(state);
+        state = add_round_key(state, &rkeys[NR*NB..(NR+1)*NB]);
 
-        Self::inv_bitslice(&state, blocks);
+        state
     }
-
-    fn sub_bytes(state: &mut [UInt64<ConstraintF>], ) {
-        debug_assert_eq!(state.len(), 8);
-
-        let u7 = state[0].clone();
-        let u6 = state[1].clone();
-        let u5 = state[2].clone();
-        let u4 = state[3].clone();
-        let u3 = state[4].clone();
-        let u2 = state[5].clone();
-        let u1 = state[6].clone();
-        let u0 = state[7].clone();
-
-        let y14 = u3.xor(&u5).unwrap();
-        let y13 = u0.xor(&u6).unwrap();
-        let y12 = y13.xor(&y14).unwrap();
-        let t1 = u4.xor(&y12).unwrap();
-        let y15 = t1.xor(&u5).unwrap();
-        let t2 = y12.bitand(&y15).unwrap();
-        let y6 = y15.xor(&u7).unwrap();
-        let y20 = t1.xor(&u1).unwrap();
-        // y12 -> stack
-        let y9 = u0.xor(&u3).unwrap();
-        // y20 -> stack
-        let y11 = y20.xor(&y9).unwrap();
-        // y9 -> stack
-        let t12 = y9.bitand(&y11).unwrap();
-        // y6 -> stack
-        let y7 = u7.xor(&y11).unwrap();
-        let y8 = u0.xor(&u5).unwrap();
-        let t0 = u1.xor(&u2).unwrap();
-        let y10 = y15.xor(&t0).unwrap();
-        // y15 -> stack
-        let y17 = y10.xor(&y11).unwrap();
-        // y14 -> stack
-        let t13 = y14.bitand(&y17).unwrap();
-        let t14 = t13.xor(&t12).unwrap();
-        // y17 -> stack
-        let y19 = y10.xor(&y8).unwrap();
-        // y10 -> stack
-        let t15 = y8.bitand(&y10).unwrap();
-        let t16 = t15.xor(&t12).unwrap();
-        let y16 = t0.xor(&y11).unwrap();
-        // y11 -> stack
-        let y21 = y13.xor(&y16).unwrap();
-        // y13 -> stack
-        let t7 = y13.bitand(&y16).unwrap();
-        // y16 -> stack
-        let y18 = u0.xor(&y16).unwrap();
-        let y1 = t0.xor(&u7).unwrap();
-        let y4 = y1.xor(&u3).unwrap();
-        // u7 -> stack
-        let t5 = y4.bitand(&u7).unwrap();
-        let t6 = t5.xor(&t2).unwrap();
-        let t18 = t6.xor(&t16).unwrap();
-        let t22 = t18.xor(&y19).unwrap();
-        let y2 = y1.xor(&u0).unwrap();
-        let t10 = y2.bitand(&y7).unwrap();
-        let t11 = t10.xor(&t7).unwrap();
-        let t20 = t11.xor(&t16).unwrap();
-        let t24 = t20.xor(&y18).unwrap();
-        let y5 = y1.xor(&u6).unwrap();
-        let t8 = y5.bitand(&y1).unwrap();
-        let t9 = t8.xor(&t7).unwrap();
-        let t19 = t9.xor(&t14).unwrap();
-        let t23 = t19.xor(&y21).unwrap();
-        let y3 = y5.xor(&y8).unwrap();
-        // y6 <- stack
-        let t3 = y3.bitand(&y6).unwrap();
-        let t4 = t3.xor(&t2).unwrap();
-        // y20 <- stack
-        let t17 = t4.xor(&y20).unwrap();
-        let t21 = t17.xor(&t14).unwrap();
-        let t26 = t21.bitand(&t23).unwrap();
-        let t27 = t24.xor(&t26).unwrap();
-        let t31 = t22.xor(&t26).unwrap();
-        let t25 = t21.xor(&t22).unwrap();
-        // y4 -> stack
-        let t28 = t25.bitand(&t27).unwrap();
-        let t29 = t28.xor(&t22).unwrap();
-        let z14 = t29.bitand(&y2).unwrap();
-        let z5 = t29.bitand(&y7).unwrap();
-        let t30 = t23.xor(&t24).unwrap();
-        let t32 = t31.bitand(&t30).unwrap();
-        let t33 = t32.xor(&t24).unwrap();
-        let t35 = t27.xor(&t33).unwrap();
-        let t36 = t24.bitand(&t35).unwrap();
-        let t38 = t27.xor(&t36).unwrap();
-        let t39 = t29.bitand(&t38).unwrap();
-        let t40 = t25.xor(&t39).unwrap();
-        let t43 = t29.xor(&t40).unwrap();
-        // y16 <- stack
-        let z3 = t43.bitand(&y16).unwrap();
-        let tc12 = z3.xor(&z5).unwrap();
-        // tc12 -> stack
-        // y13 <- stack
-        let z12 = t43.bitand(&y13).unwrap();
-        let z13 = t40.bitand(&y5).unwrap();
-        let z4 = t40.bitand(&y1).unwrap();
-        let tc6 = z3.xor(&z4).unwrap();
-        let t34 = t23.xor(&t33).unwrap();
-        let t37 = t36.xor(&t34).unwrap();
-        let t41 = t40.xor(&t37).unwrap();
-        // y10 <- stack
-        let z8 = t41.bitand(&y10).unwrap();
-        let z17 = t41.bitand(&y8).unwrap();
-        let t44 = t33.xor(&t37).unwrap();
-        // y15 <- stack
-        let z0 = t44.bitand(&y15).unwrap();
-        // z17 -> stack
-        // y12 <- stack
-        let z9 = t44.bitand(&y12).unwrap();
-        let z10 = t37.bitand(&y3).unwrap();
-        let z1 = t37.bitand(&y6).unwrap();
-        let tc5 = z1.xor(&z0).unwrap();
-        let tc11 = tc6.xor(&tc5).unwrap();
-        // y4 <- stack
-        let z11 = t33.bitand(&y4).unwrap();
-        let t42 = t29.xor(&t33).unwrap();
-        let t45 = t42.xor(&t41).unwrap();
-        // y17 <- stack
-        let z7 = t45.bitand(&y17).unwrap();
-        let tc8 = z7.xor(&tc6).unwrap();
-        // y14 <- stack
-        let z16 = t45.bitand(&y14).unwrap();
-        // y11 <- stack
-        let z6 = t42.bitand(&y11).unwrap();
-        let tc16 = z6.xor(&tc8).unwrap();
-        // z14 -> stack
-        // y9 <- stack
-        let z15 = t42.bitand(&y9).unwrap();
-        let tc20 = z15.xor(&tc16).unwrap();
-        let tc1 = z15.xor(&z16).unwrap();
-        let tc2 = z10.xor(&tc1).unwrap();
-        let tc21 = tc2.xor(&z11).unwrap();
-        let tc3 = z9.xor(&tc2).unwrap();
-        let s0 = tc3.xor(&tc16).unwrap();
-        let s3 = tc3.xor(&tc11).unwrap();
-        let s1 = s3.xor(&tc16).unwrap();
-        let tc13 = z13.xor(&tc1).unwrap();
-        // u7 <- stack
-        let z2 = t33.bitand(&u7).unwrap();
-        let tc4 = z0.xor(&z2).unwrap();
-        let tc7 = z12.xor(&tc4).unwrap();
-        let tc9 = z8.xor(&tc7).unwrap();
-        let tc10 = tc8.xor(&tc9).unwrap();
-        // z14 <- stack
-        let tc17 = z14.xor(&tc10).unwrap();
-        let s5 = tc21.xor(&tc17).unwrap();
-        let tc26 = tc17.xor(&tc20).unwrap();
-        // z17 <- stack
-        let s2 = tc26.xor(&z17).unwrap();
-        // tc12 <- stack
-        let tc14 = tc4.xor(&tc12).unwrap();
-        let tc18 = tc13.xor(&tc14).unwrap();
-        let s6 = tc10.xor(&tc18).unwrap();
-        let s7 = z12.xor(&tc18).unwrap();
-        let s4 = tc14.xor(&s3).unwrap();
-
-        state[0] = s7;
-        state[1] = s6;
-        state[2] = s5;
-        state[3] = s4;
-        state[4] = s3;
-        state[5] = s2;
-        state[6] = s1;
-        state[7] = s0;
-    }
-
-    #[inline]
-    fn sub_bytes_nots(state: &mut [UInt64<ConstraintF>]) {
-        debug_assert_eq!(state.len(), 8);
-        state[0] = state[0].xor(&UInt64::constant(0xffffffffffffffff)).unwrap();
-        state[1] = state[1].xor(&UInt64::constant(0xffffffffffffffff)).unwrap();
-        state[5] = state[5].xor(&UInt64::constant(0xffffffffffffffff)).unwrap();
-        state[6] = state[6].xor(&UInt64::constant(0xffffffffffffffff)).unwrap();
-    }
-
-    fn memshift32(buffer: &mut [UInt64<ConstraintF>], src_offset: usize) {
-        debug_assert_eq!(src_offset % 8, 0);
-
-        let dst_offset = src_offset + 8;
-        debug_assert!(dst_offset + 8 <= buffer.len());
-
-        for i in (0..8).rev() {
-            buffer[dst_offset + i] = buffer[src_offset + i].clone();
-        }
-    }
-
-    fn add_round_key(state: &mut AesState<ConstraintF>, rkey: &[UInt64<ConstraintF>]) {
-        debug_assert_eq!(rkey.len(), 8);
-        for (a, b) in state.iter_mut().zip(rkey) {
-            *a = (*a).xor(b).unwrap();
-        }
-    }
-
-    #[inline(always)]
-    fn add_round_constant_bit(state: &mut [UInt64<ConstraintF>], bit: usize) {
-        state[bit] = state[bit].xor(&UInt64::constant(0x00000000f0000000)).unwrap();
-    }
-
-    #[inline(always)]
-    fn inv_shift_rows_1(state: &mut [UInt64<ConstraintF>]) {
-        Self::shift_rows_3(state);
-    }
-
-    #[inline(always)]
-    fn inv_shift_rows_2(state: &mut [UInt64<ConstraintF>]) {
-        Self::shift_rows_2(state);
-    }
-
-    #[cfg(not(feature = "compact"))]
-    #[inline(always)]
-    fn inv_shift_rows_3(state: &mut [UInt64<ConstraintF>]) {
-        Self::shift_rows_1(state);
-    }
-
-    fn xor_columns(rkeys: &mut [UInt64<ConstraintF>], offset: usize, idx_xor: usize, idx_ror: u32) {
-        for i in 0..8 {
-            let off_i = offset + i;
-            let rk = rkeys[off_i - idx_xor].xor(&(UInt64::constant(0x000f000f000f000f).bitand(&Self::ror(rkeys[off_i].clone(), idx_ror)).unwrap())).unwrap();
-            rkeys[off_i] = rk
-                .xor(&(UInt64::constant(0xfff0fff0fff0fff0).bitand(&rk.shl(4)).unwrap())).unwrap()
-                .xor(&(UInt64::constant(0xff00ff00ff00ff00).bitand(&rk.shl(8)).unwrap())).unwrap()
-                .xor(&(UInt64::constant(0xf000f000f000f000).bitand(&rk.shl(12)).unwrap())).unwrap();
-        }
-    }
-
-    fn bitslice(
-        output: &mut [UInt64<ConstraintF>],
-        input0: &[UInt8<ConstraintF>],
-        input1: &[UInt8<ConstraintF>],
-        input2: &[UInt8<ConstraintF>],
-        input3: &[UInt8<ConstraintF>])
-    {
-        debug_assert_eq!(output.len(), 8);
-        debug_assert_eq!(input0.len(), 16);
-        debug_assert_eq!(input1.len(), 16);
-        debug_assert_eq!(input2.len(), 16);
-        debug_assert_eq!(input3.len(), 16);
-
-        fn to_uint64<ConstraintF: PrimeField>(input: UInt8<ConstraintF>) -> UInt64<ConstraintF> {
-            // TODO: make sure zeroes are added to the correct positions
-            let mut byte_bits = input.to_bits_le().unwrap();
-            let mut zeros: Vec<_> = iter::repeat(Boolean::constant(false)).take(56).collect();
-            byte_bits.append(&mut zeros);
-            UInt64::from_bits_le(&byte_bits)
-        }
-
-        #[rustfmt::skip]
-        fn read_reordered<ConstraintF: PrimeField>(input: &[UInt8<ConstraintF>]) -> UInt64<ConstraintF> {
-            (to_uint64(input[0x0].clone())).bitor(
-            &(to_uint64(input[0x1].clone()))).unwrap().shl(0x10).bitor(
-            &(to_uint64(input[0x2].clone()))).unwrap().shl(0x20).bitor(
-            &(to_uint64(input[0x3].clone()))).unwrap().shl(0x30).bitor(
-            &(to_uint64(input[0x8].clone()))).unwrap().shl(0x08).bitor(
-            &(to_uint64(input[0x9].clone()))).unwrap().shl(0x18).bitor(
-            &(to_uint64(input[0xa].clone()))).unwrap().shl(0x28).bitor(
-            &(to_uint64(input[0xb].clone()))).unwrap().shl(0x38)
-        }
-
-        // Reorder each block's bytes on input
-        //     __ __ c1 c0 r1 r0 __ __ __ => __ __ c0 r1 r0 c1 __ __ __
-        // Reorder by relabeling (note the order of input)
-        //     b1 b0 c0 __ __ __ __ __ __ => c0 b1 b0 __ __ __ __ __ __
-        let mut t0 = read_reordered(&input0[0x00..0x0c]);
-        let mut t4 = read_reordered(&input0[0x04..0x10]);
-        let mut t1 = read_reordered(&input1[0x00..0x0c]);
-        let mut t5 = read_reordered(&input1[0x04..0x10]);
-        let mut t2 = read_reordered(&input2[0x00..0x0c]);
-        let mut t6 = read_reordered(&input2[0x04..0x10]);
-        let mut t3 = read_reordered(&input3[0x00..0x0c]);
-        let mut t7 = read_reordered(&input3[0x04..0x10]);
-
-        // Bit Index Swap 6 <-> 0:
-        //     __ __ b0 __ __ __ __ __ p0 => __ __ p0 __ __ __ __ __ b0
-        let m0 = UInt64::constant(0x5555555555555555);
-        Self::delta_swap_2(&mut t1, &mut t0, 1, m0.clone());
-        Self::delta_swap_2(&mut t3, &mut t2, 1, m0.clone());
-        Self::delta_swap_2(&mut t5, &mut t4, 1, m0.clone());
-        Self::delta_swap_2(&mut t7, &mut t6, 1, m0.clone());
-
-        // Bit Index Swap 7 <-> 1:
-        //     __ b1 __ __ __ __ __ p1 __ => __ p1 __ __ __ __ __ b1 __
-        let m1 =  UInt64::constant(0x3333333333333333);
-        Self::delta_swap_2(&mut t2, &mut t0, 2, m1.clone());
-        Self::delta_swap_2(&mut t3, &mut t1, 2, m1.clone());
-        Self::delta_swap_2(&mut t6, &mut t4, 2, m1.clone());
-        Self::delta_swap_2(&mut t7, &mut t5, 2, m1.clone());
-
-        // Bit Index Swap 8 <-> 2:
-        //     c0 __ __ __ __ __ p2 __ __ => p2 __ __ __ __ __ c0 __ __
-        let m2 = UInt64::constant(0x0f0f0f0f0f0f0f0f);
-        Self::delta_swap_2(&mut t4, &mut t0, 4, m2.clone());
-        Self::delta_swap_2(&mut t5, &mut t1, 4, m2.clone());
-        Self::delta_swap_2(&mut t6, &mut t2, 4, m2.clone());
-        Self::delta_swap_2(&mut t7, &mut t3, 4, m2.clone());
-
-        // Final bitsliced bit index, as desired:
-        //     p2 p1 p0 r1 r0 c1 c0 b1 b0
-        output[0] = t0;
-        output[1] = t1;
-        output[2] = t2;
-        output[3] = t3;
-        output[4] = t4;
-        output[5] = t5;
-        output[6] = t6;
-        output[7] = t7;
-    }
-
-    fn inv_bitslice(input: &[UInt64<ConstraintF>], output: &mut [[UInt8<ConstraintF>; 16]]) {
-        debug_assert_eq!(input.len(), 8);
-        debug_assert_eq!(output.len(), 4);
-
-        // Unbitslicing is a bit index manipulation. 512 bits of data means each bit is positioned at
-        // a 9-bit index. AES data is 4 blocks, each one a 4x4 column-major matrix of bytes, so the
-        // desired index for the output is ([b]lock, [c]olumn, [r]ow, [p]osition):
-        //     b1 b0 c1 c0 r1 r0 p2 p1 p0
-        //
-        // The initially bitsliced data groups first by bit position, then row, column, block:
-        //     p2 p1 p0 r1 r0 c1 c0 b1 b0
-
-        let mut t0 = input[0].clone();
-        let mut t1 = input[1].clone();
-        let mut t2 = input[2].clone();
-        let mut t3 = input[3].clone();
-        let mut t4 = input[4].clone();
-        let mut t5 = input[5].clone();
-        let mut t6 = input[6].clone();
-        let mut t7 = input[7].clone();
-
-        // TODO: these bit index swaps are identical to those in 'packing'
-
-        // Bit Index Swap 6 <-> 0:
-        //     __ __ p0 __ __ __ __ __ b0 => __ __ b0 __ __ __ __ __ p0
-        let m0 = UInt64::constant(0x5555555555555555);
-        Self::delta_swap_2(&mut t1, &mut t0, 1, m0.clone());
-        Self::delta_swap_2(&mut t3, &mut t2, 1, m0.clone());
-        Self::delta_swap_2(&mut t5, &mut t4, 1, m0.clone());
-        Self::delta_swap_2(&mut t7, &mut t6, 1, m0.clone());
-
-        // Bit Index Swap 7 <-> 1:
-        //     __ p1 __ __ __ __ __ b1 __ => __ b1 __ __ __ __ __ p1 __
-        let m1 = UInt64::constant(0x3333333333333333);
-        Self::delta_swap_2(&mut t2, &mut t0, 2, m1.clone());
-        Self::delta_swap_2(&mut t3, &mut t1, 2, m1.clone());
-        Self::delta_swap_2(&mut t6, &mut t4, 2, m1.clone());
-        Self::delta_swap_2(&mut t7, &mut t5, 2, m1.clone());
-
-        // Bit Index Swap 8 <-> 2:
-        //     p2 __ __ __ __ __ c0 __ __ => c0 __ __ __ __ __ p2 __ __
-        let m2 = UInt64::constant(0x0f0f0f0f0f0f0f0f);
-        Self::delta_swap_2(&mut t4, &mut t0, 4, m2.clone());
-        Self::delta_swap_2(&mut t5, &mut t1, 4, m2.clone());
-        Self::delta_swap_2(&mut t6, &mut t2, 4, m2.clone());
-        Self::delta_swap_2(&mut t7, &mut t3, 4, m2.clone());
-
-        #[rustfmt::skip]
-        fn write_reordered<ConstraintF: PrimeField>(columns: UInt64<ConstraintF>, output: &mut [UInt8<ConstraintF>]) {
-            let column_bytes = columns.to_bytes().unwrap();
-            output[0x0] = (column_bytes.get(0)).unwrap().clone();
-            output[0x1] = (column_bytes.get(2)).unwrap().clone(); // (columns >> 0x10) as u8;
-            output[0x2] = (column_bytes.get(4)).unwrap().clone(); // (columns >> 0x20) as u8;
-            output[0x3] = (column_bytes.get(6)).unwrap().clone(); // (columns >> 0x30) as u8;
-            output[0x8] = (column_bytes.get(1)).unwrap().clone(); // (columns >> 0x08) as u8;
-            output[0x9] = (column_bytes.get(3)).unwrap().clone(); // (columns >> 0x18) as u8;
-            output[0xa] = (column_bytes.get(5)).unwrap().clone(); // (columns >> 0x28) as u8;
-            output[0xb] = (column_bytes.get(7)).unwrap().clone(); // (columns >> 0x38) as u8;
-        }
-
-        // Reorder by relabeling (note the order of output)
-        //     c0 b1 b0 __ __ __ __ __ __ => b1 b0 c0 __ __ __ __ __ __
-        // Reorder each block's bytes on output
-        //     __ __ c0 r1 r0 c1 __ __ __ => __ __ c1 c0 r1 r0 __ __ __
-        write_reordered(t0, &mut output[0][0x00..0x0c]);
-        write_reordered(t4, &mut output[0][0x04..0x10]);
-        write_reordered(t1, &mut output[1][0x00..0x0c]);
-        write_reordered(t5, &mut output[1][0x04..0x10]);
-        write_reordered(t2, &mut output[2][0x00..0x0c]);
-        write_reordered(t6, &mut output[2][0x04..0x10]);
-        write_reordered(t3, &mut output[3][0x00..0x0c]);
-        write_reordered(t7, &mut output[3][0x04..0x10]);
-
-        // Final AES bit index, as desired:
-        //     b1 b0 c1 c0 r1 r0 p2 p1 p0
-    }
-
-    #[inline]
-    fn delta_swap_1(a: &mut UInt64<ConstraintF>, shift: u32, mask: UInt64<ConstraintF>) {
-        let t = ((*a).xor(&((*a).shr(shift as usize))).unwrap()).bitand(&mask).unwrap();
-        *a = (*a).xor(&(t.xor(&(t.shl(shift as usize))).unwrap())).unwrap();
-    }
-
-    #[inline]
-    fn delta_swap_2(a: &mut UInt64<ConstraintF>, b: &mut UInt64<ConstraintF>, shift: u32, mask: UInt64<ConstraintF>) {
-        let t = ((*a).xor(&((*b).shr(shift as usize))).unwrap()).bitand(&mask).unwrap();
-        *a = (*a).xor(&t).unwrap();
-        *b = (*b).xor(&(t.shl(shift as usize))).unwrap();
-    }
-
-    /// Applies ShiftRows once on an AES state (or key).
-    #[cfg(any(not(feature = "compact"), feature = "hazmat"))]
-    #[inline]
-    fn shift_rows_1(state: &mut [UInt64<ConstraintF>]) {
-        debug_assert_eq!(state.len(), 8);
-        for x in state.iter_mut() {
-            Self::delta_swap_1(x, 8, UInt64::constant(0x00f000ff000f0000));
-            Self::delta_swap_1(x, 4, UInt64::constant(0x0f0f00000f0f0000));
-        }
-    }
-
-    /// Applies ShiftRows twice on an AES state (or key).
-    #[inline]
-    fn shift_rows_2(state: &mut [UInt64<ConstraintF>]) {
-        debug_assert_eq!(state.len(), 8);
-        for x in state.iter_mut() {
-            Self::delta_swap_1(x, 8, UInt64::constant(0x00ff000000ff0000));
-        }
-    }
-
-    /// Applies ShiftRows three times on an AES state (or key).
-    #[inline]
-    fn shift_rows_3(state: &mut [UInt64<ConstraintF>]) {
-        debug_assert_eq!(state.len(), 8);
-        for x in state.iter_mut() {
-            Self::delta_swap_1(x, 8, UInt64::constant(0x000f00ff00f00000));
-            Self::delta_swap_1(x, 4, UInt64::constant(0x0f0f00000f0f0000));
-        }
-    }
-
-    #[inline(always)]
-    fn ror(x: UInt64<ConstraintF>, y: u32) -> UInt64<ConstraintF> {
-        x.rotr(y as usize)
-    }
-
-    #[inline(always)]
-    fn ror_distance(rows: u32, cols: u32) -> u32 {
-        (rows << 4) + (cols << 2)
-    }
-
-    #[inline(always)]
-    fn rotate_rows_1(x: UInt64<ConstraintF>) -> UInt64<ConstraintF> {
-        Self::ror(x, Self::ror_distance(1, 0))
-    }
-
-    #[inline(always)]
-    fn rotate_rows_2(x: UInt64<ConstraintF>) -> UInt64<ConstraintF> {
-        Self::ror(x, Self::ror_distance(2, 0))
-    }
-
-    #[inline(always)]
-    #[rustfmt::skip]
-    fn rotate_rows_and_columns_1_1(x: UInt64<ConstraintF>) -> UInt64<ConstraintF> {
-        (Self::ror(x.clone(), Self::ror_distance(1, 1)).bitand(&UInt64::constant(0x0fff0fff0fff0fff)).unwrap()).bitor(
-            &(Self::ror(x, Self::ror_distance(0, 1)).bitand(&UInt64::constant(0xf000f000f000f000)).unwrap())).unwrap()
-    }
-
-    #[cfg(not(feature = "compact"))]
-    #[inline(always)]
-    #[rustfmt::skip]
-    fn rotate_rows_and_columns_1_2(x: UInt64<ConstraintF>) -> UInt64<ConstraintF> {
-        (Self::ror(x.clone(), Self::ror_distance(1, 2)).bitand(&UInt64::constant(0x00ff00ff00ff00ff)).unwrap()).bitor(
-            &(Self::ror(x, Self::ror_distance(0, 2)).bitand(&UInt64::constant(0xff00ff00ff00ff00)).unwrap())).unwrap()
-    }
-
-    #[cfg(not(feature = "compact"))]
-    #[inline(always)]
-    #[rustfmt::skip]
-    fn rotate_rows_and_columns_1_3(x: UInt64<ConstraintF>) -> UInt64<ConstraintF> {
-        (Self::ror(x.clone(), Self::ror_distance(1, 3)).bitand(&UInt64::constant(0x000f000f000f000f)).unwrap()).bitor(
-            &(Self::ror(x, Self::ror_distance(0, 3)).bitand(&UInt64::constant(0xfff0fff0fff0fff0)).unwrap())).unwrap()
-    }
-
-    #[inline(always)]
-    #[rustfmt::skip]
-    fn rotate_rows_and_columns_2_2(x: UInt64<ConstraintF>) -> UInt64<ConstraintF> {
-        (Self::ror(x.clone(), Self::ror_distance(2, 2)).bitand(&UInt64::constant(0x00ff00ff00ff00ff)).unwrap()).bitor(
-            &(Self::ror(x, Self::ror_distance(1, 2)).bitand(&UInt64::constant(0xff00ff00ff00ff00)).unwrap())).unwrap()
-    }
-
-    define_mix_columns!(
-        mix_columns_0,
-        Self::rotate_rows_1,
-        Self::rotate_rows_2,
-        AesState<ConstraintF>,
-    );
-
-    define_mix_columns!(
-        mix_columns_1,
-        Self::rotate_rows_and_columns_1_1,
-        Self::rotate_rows_and_columns_2_2,
-        AesState<ConstraintF>,
-    );
-
-    define_mix_columns!(
-        mix_columns_2,
-        Self::rotate_rows_and_columns_1_2,
-        Self::rotate_rows_2,
-        AesState<ConstraintF>,
-    );
-
-    define_mix_columns!(
-        mix_columns_3,
-        Self::rotate_rows_and_columns_1_3,
-        Self::rotate_rows_and_columns_2_2,
-        AesState<ConstraintF>,
-    );
 }
 
 /// The unit type for circuit variables. This contains no data.
@@ -813,28 +386,22 @@ impl<ConstraintF: PrimeField> SymmetricEncryptionGadget<Aes128, ConstraintF> for
     type KeyVar = KeyVar<ConstraintF>;
     type RandomnessVar = RandomnessUnitVar<ConstraintF>;
 
-    #[allow(unused_variables, unused_mut)]
     fn encrypt(
         _parameters: &Self::ParametersVar,
         message: &Self::PlaintextVar,
         _randomness: &Self::RandomnessVar,
         key: &Self::KeyVar,
     ) -> Result<Self::OutputVar, SynthesisError> {
-        let rkeys: Vec<UInt64<ConstraintF>> = Aes128Gadget::aes128_key_schedule(key.key.clone());
-        let mut blocks: [[UInt8<ConstraintF>; 16]; 4] = [
-            message.plaintext.clone(),
-            message.plaintext.clone(),
-            message.plaintext.clone(),
-            message.plaintext.clone(),
-        ];
-        Aes128Gadget::aes128_encrypt(&rkeys, &mut blocks);
-        Ok(OutputVar{ ciphertext: blocks[0].clone() })
+        let rkeys: [[UInt8<ConstraintF>; 4]; NB * (NR + 1)] = Aes128Gadget::aes128_key_schedule(key.key.clone());
+        let ciphertext = Aes128Gadget::aes128_encrypt(message.plaintext.clone(), rkeys);
+        Ok(OutputVar{ ciphertext })
     }
 }
 
 #[cfg(test)]
 #[allow(unused_imports)]
 mod aes_test {
+    use std::iter::zip;
     use super::*;
 
     use ark_ed_on_bls12_381::{EdwardsProjective as JubJub, Fr};
@@ -844,28 +411,172 @@ mod aes_test {
     use ark_std::rand::RngCore;
     use ark_std::test_rng;
     use crate::encryption::{SymmetricEncryptionScheme};
+    use crate::encryption::elgamal::constraints::ConstraintF;
+
+    // Keys and Expected Key Schedules from:
+    // (1) https://www.samiam.org/key-schedule.html
+    // (2) https://csrc.nist.gov/csrc/media/publications/fips/197/final/documents/fips-197.pdf (Appendix A)
+    const CIPHER_KEYS: [[u8; 16]; 5] = [
+        [ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, ],
+        [ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, ],
+        [ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, ],
+        [ 0x49, 0x20, 0xe2, 0x99, 0xa5, 0x20, 0x52, 0x61, 0x64, 0x69, 0x6f, 0x47, 0x61, 0x74, 0x75, 0x6e, ],
+        [ 0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c, ],
+    ];
+
+    const KEY_SCHEDULES: [[u8; 176]; 5] = [
+        [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x62, 0x63, 0x63, 0x63, 0x62, 0x63, 0x63, 0x63, 0x62, 0x63, 0x63, 0x63, 0x62, 0x63, 0x63, 0x63,
+            0x9b, 0x98, 0x98, 0xc9, 0xf9, 0xfb, 0xfb, 0xaa, 0x9b, 0x98, 0x98, 0xc9, 0xf9, 0xfb, 0xfb, 0xaa,
+            0x90, 0x97, 0x34, 0x50, 0x69, 0x6c, 0xcf, 0xfa, 0xf2, 0xf4, 0x57, 0x33, 0x0b, 0x0f, 0xac, 0x99,
+            0xee, 0x06, 0xda, 0x7b, 0x87, 0x6a, 0x15, 0x81, 0x75, 0x9e, 0x42, 0xb2, 0x7e, 0x91, 0xee, 0x2b,
+            0x7f, 0x2e, 0x2b, 0x88, 0xf8, 0x44, 0x3e, 0x09, 0x8d, 0xda, 0x7c, 0xbb, 0xf3, 0x4b, 0x92, 0x90,
+            0xec, 0x61, 0x4b, 0x85, 0x14, 0x25, 0x75, 0x8c, 0x99, 0xff, 0x09, 0x37, 0x6a, 0xb4, 0x9b, 0xa7,
+            0x21, 0x75, 0x17, 0x87, 0x35, 0x50, 0x62, 0x0b, 0xac, 0xaf, 0x6b, 0x3c, 0xc6, 0x1b, 0xf0, 0x9b,
+            0x0e, 0xf9, 0x03, 0x33, 0x3b, 0xa9, 0x61, 0x38, 0x97, 0x06, 0x0a, 0x04, 0x51, 0x1d, 0xfa, 0x9f,
+            0xb1, 0xd4, 0xd8, 0xe2, 0x8a, 0x7d, 0xb9, 0xda, 0x1d, 0x7b, 0xb3, 0xde, 0x4c, 0x66, 0x49, 0x41,
+            0xb4, 0xef, 0x5b, 0xcb, 0x3e, 0x92, 0xe2, 0x11, 0x23, 0xe9, 0x51, 0xcf, 0x6f, 0x8f, 0x18, 0x8e,
+        ],
+        [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xe8, 0xe9, 0xe9, 0xe9, 0x17, 0x16, 0x16, 0x16, 0xe8, 0xe9, 0xe9, 0xe9, 0x17, 0x16, 0x16, 0x16,
+            0xad, 0xae, 0xae, 0x19, 0xba, 0xb8, 0xb8, 0x0f, 0x52, 0x51, 0x51, 0xe6, 0x45, 0x47, 0x47, 0xf0,
+            0x09, 0x0e, 0x22, 0x77, 0xb3, 0xb6, 0x9a, 0x78, 0xe1, 0xe7, 0xcb, 0x9e, 0xa4, 0xa0, 0x8c, 0x6e,
+            0xe1, 0x6a, 0xbd, 0x3e, 0x52, 0xdc, 0x27, 0x46, 0xb3, 0x3b, 0xec, 0xd8, 0x17, 0x9b, 0x60, 0xb6,
+            0xe5, 0xba, 0xf3, 0xce, 0xb7, 0x66, 0xd4, 0x88, 0x04, 0x5d, 0x38, 0x50, 0x13, 0xc6, 0x58, 0xe6,
+            0x71, 0xd0, 0x7d, 0xb3, 0xc6, 0xb6, 0xa9, 0x3b, 0xc2, 0xeb, 0x91, 0x6b, 0xd1, 0x2d, 0xc9, 0x8d,
+            0xe9, 0x0d, 0x20, 0x8d, 0x2f, 0xbb, 0x89, 0xb6, 0xed, 0x50, 0x18, 0xdd, 0x3c, 0x7d, 0xd1, 0x50,
+            0x96, 0x33, 0x73, 0x66, 0xb9, 0x88, 0xfa, 0xd0, 0x54, 0xd8, 0xe2, 0x0d, 0x68, 0xa5, 0x33, 0x5d,
+            0x8b, 0xf0, 0x3f, 0x23, 0x32, 0x78, 0xc5, 0xf3, 0x66, 0xa0, 0x27, 0xfe, 0x0e, 0x05, 0x14, 0xa3,
+            0xd6, 0x0a, 0x35, 0x88, 0xe4, 0x72, 0xf0, 0x7b, 0x82, 0xd2, 0xd7, 0x85, 0x8c, 0xd7, 0xc3, 0x26,
+        ],
+        [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+            0xd6, 0xaa, 0x74, 0xfd, 0xd2, 0xaf, 0x72, 0xfa, 0xda, 0xa6, 0x78, 0xf1, 0xd6, 0xab, 0x76, 0xfe,
+            0xb6, 0x92, 0xcf, 0x0b, 0x64, 0x3d, 0xbd, 0xf1, 0xbe, 0x9b, 0xc5, 0x00, 0x68, 0x30, 0xb3, 0xfe,
+            0xb6, 0xff, 0x74, 0x4e, 0xd2, 0xc2, 0xc9, 0xbf, 0x6c, 0x59, 0x0c, 0xbf, 0x04, 0x69, 0xbf, 0x41,
+            0x47, 0xf7, 0xf7, 0xbc, 0x95, 0x35, 0x3e, 0x03, 0xf9, 0x6c, 0x32, 0xbc, 0xfd, 0x05, 0x8d, 0xfd,
+            0x3c, 0xaa, 0xa3, 0xe8, 0xa9, 0x9f, 0x9d, 0xeb, 0x50, 0xf3, 0xaf, 0x57, 0xad, 0xf6, 0x22, 0xaa,
+            0x5e, 0x39, 0x0f, 0x7d, 0xf7, 0xa6, 0x92, 0x96, 0xa7, 0x55, 0x3d, 0xc1, 0x0a, 0xa3, 0x1f, 0x6b,
+            0x14, 0xf9, 0x70, 0x1a, 0xe3, 0x5f, 0xe2, 0x8c, 0x44, 0x0a, 0xdf, 0x4d, 0x4e, 0xa9, 0xc0, 0x26,
+            0x47, 0x43, 0x87, 0x35, 0xa4, 0x1c, 0x65, 0xb9, 0xe0, 0x16, 0xba, 0xf4, 0xae, 0xbf, 0x7a, 0xd2,
+            0x54, 0x99, 0x32, 0xd1, 0xf0, 0x85, 0x57, 0x68, 0x10, 0x93, 0xed, 0x9c, 0xbe, 0x2c, 0x97, 0x4e,
+            0x13, 0x11, 0x1d, 0x7f, 0xe3, 0x94, 0x4a, 0x17, 0xf3, 0x07, 0xa7, 0x8b, 0x4d, 0x2b, 0x30, 0xc5,
+        ],
+        [
+            0x49, 0x20, 0xe2, 0x99, 0xa5, 0x20, 0x52, 0x61, 0x64, 0x69, 0x6f, 0x47, 0x61, 0x74, 0x75, 0x6e,
+            0xda, 0xbd, 0x7d, 0x76, 0x7f, 0x9d, 0x2f, 0x17, 0x1b, 0xf4, 0x40, 0x50, 0x7a, 0x80, 0x35, 0x3e,
+            0x15, 0x2b, 0xcf, 0xac, 0x6a, 0xb6, 0xe0, 0xbb, 0x71, 0x42, 0xa0, 0xeb, 0x0b, 0xc2, 0x95, 0xd5,
+            0x34, 0x01, 0xcc, 0x87, 0x5e, 0xb7, 0x2c, 0x3c, 0x2f, 0xf5, 0x8c, 0xd7, 0x24, 0x37, 0x19, 0x02,
+            0xa6, 0xd5, 0xbb, 0xb1, 0xf8, 0x62, 0x97, 0x8d, 0xd7, 0x97, 0x1b, 0x5a, 0xf3, 0xa0, 0x02, 0x58,
+            0x56, 0xa2, 0xd1, 0xbc, 0xae, 0xc0, 0x46, 0x31, 0x79, 0x57, 0x5d, 0x6b, 0x8a, 0xf7, 0x5f, 0x33,
+            0x1e, 0x6d, 0x12, 0xc2, 0xb0, 0xad, 0x54, 0xf3, 0xc9, 0xfa, 0x09, 0x98, 0x43, 0x0d, 0x56, 0xab,
+            0x89, 0xdc, 0x70, 0xd8, 0x39, 0x71, 0x24, 0x2b, 0xf0, 0x8b, 0x2d, 0xb3, 0xb3, 0x86, 0x7b, 0x18,
+            0x4d, 0xfd, 0xdd, 0xb5, 0x74, 0x8c, 0xf9, 0x9e, 0x84, 0x07, 0xd4, 0x2d, 0x37, 0x81, 0xaf, 0x35,
+            0x5a, 0x84, 0x4b, 0x2f, 0x2e, 0x08, 0xb2, 0xb1, 0xaa, 0x0f, 0x66, 0x9c, 0x9d, 0x8e, 0xc9, 0xa9,
+            0x75, 0x59, 0x98, 0x71, 0x5b, 0x51, 0x2a, 0xc0, 0xf1, 0x5e, 0x4c, 0x5c, 0x6c, 0xd0, 0x85, 0xf5,
+        ],
+        [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c,
+            0xa0, 0xfa, 0xfe, 0x17, 0x88, 0x54, 0x2c, 0xb1, 0x23, 0xa3, 0x39, 0x39, 0x2a, 0x6c, 0x76, 0x05,
+            0xf2, 0xc2, 0x95, 0xf2, 0x7a, 0x96, 0xb9, 0x43, 0x59, 0x35, 0x80, 0x7a, 0x73, 0x59, 0xf6, 0x7f,
+            0x3d, 0x80, 0x47, 0x7d, 0x47, 0x16, 0xfe, 0x3e, 0x1e, 0x23, 0x7e, 0x44, 0x6d, 0x7a, 0x88, 0x3b,
+            0xef, 0x44, 0xa5, 0x41, 0xa8, 0x52, 0x5b, 0x7f, 0xb6, 0x71, 0x25, 0x3b, 0xdb, 0x0b, 0xad, 0x00,
+            0xd4, 0xd1, 0xc6, 0xf8, 0x7c, 0x83, 0x9d, 0x87, 0xca, 0xf2, 0xb8, 0xbc, 0x11, 0xf9, 0x15, 0xbc,
+            0x6d, 0x88, 0xa3, 0x7a, 0x11, 0x0b, 0x3e, 0xfd, 0xdb, 0xf9, 0x86, 0x41, 0xca, 0x00, 0x93, 0xfd,
+            0x4e, 0x54, 0xf7, 0x0e, 0x5f, 0x5f, 0xc9, 0xf3, 0x84, 0xa6, 0x4f, 0xb2, 0x4e, 0xa6, 0xdc, 0x4f,
+            0xea, 0xd2, 0x73, 0x21, 0xb5, 0x8d, 0xba, 0xd2, 0x31, 0x2b, 0xf5, 0x60, 0x7f, 0x8d, 0x29, 0x2f,
+            0xac, 0x77, 0x66, 0xf3, 0x19, 0xfa, 0xdc, 0x21, 0x28, 0xd1, 0x29, 0x41, 0x57, 0x5c, 0x00, 0x6e,
+            0xd0, 0x14, 0xf9, 0xa8, 0xc9, 0xee, 0x25, 0x89, 0xe1, 0x3f, 0x0c, 0xc8, 0xb6, 0x63, 0x0c, 0xa6,
+        ],
+    ];
+
+    // Test key expansion method
+    #[test]
+    fn test_key_expansion() {
+        type AesGadget = Aes128Gadget<Fr>;
+
+        for (ck, ks) in zip(CIPHER_KEYS, KEY_SCHEDULES) {
+            let cipher_key = ck.map(|byte: u8| UInt8::constant(byte));
+
+            let round_keys: [[UInt8<Fr>; 4]; NB * (NR + 1)] = AesGadget::aes128_key_schedule(cipher_key);
+
+            assert_eq!(round_keys.len(), ks.len() / 4);
+            let mut i = 0;
+            for word in round_keys {
+                for byte in word {
+                    assert_eq!(byte.value().unwrap(), ks[i]);
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    // Test vector for cipher algorithm.
+    // Source: https://csrc.nist.gov/csrc/media/publications/fips/197/final/documents/fips-197.pdf (Appendix B)
+    const FIPS_197_CIPHERKEY: [u8; 16] = [
+        0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c,
+    ];
+    const FIPS_197_INPUT: [u8; 16] = [
+        0x32, 0x43, 0xf6, 0xa8, 0x88, 0x5a, 0x30, 0x8d, 0x31, 0x31, 0x98, 0xa2, 0xe0, 0x37, 0x07, 0x34,
+    ];
+    const FIPS_197_OUTPUT: [u8; 16] = [
+        0x39, 0x25, 0x84, 0x1d, 0x02, 0xdc, 0x09, 0xfb, 0xdc, 0x11, 0x85, 0x97, 0x19, 0x6a, 0x0b, 0x32,
+    ];
+
+    // Test against the step-by-step example detailed in FIPS-197.
+    // Source: https://csrc.nist.gov/csrc/media/publications/fips/197/final/documents/fips-197.pdf
+    #[test]
+    fn test_fips_197_example() {
+        let cipher_key: [UInt8<Fr>; 16] = FIPS_197_CIPHERKEY.map(|byte: u8| UInt8::constant(byte));
+        let plaintext: [UInt8<Fr>; 16] = FIPS_197_INPUT.map(|byte: u8| UInt8::constant(byte));
+        let round_keys: [[UInt8<Fr>; 4]; NB * (NR + 1)] = Aes128Gadget::aes128_key_schedule(cipher_key);
+        let ciphertext: [UInt8<Fr>; 16] = Aes128Gadget::aes128_encrypt(plaintext, round_keys);
+
+        assert_eq!(FIPS_197_OUTPUT, ciphertext.map(|byte| byte.value().unwrap()));
+    }
+
+    // Test vector for cipher algorithm.
+    // Source: http://www.herongyang.com/Cryptography/AES-Example-Vector-of-AES-Encryption.html
+    const HERONG_YANG_CIPHERKEY: [u8; 16] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    ];
+    const HERONG_YANG_INPUT: [u8; 16] = [
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+    ];
+    const HERONG_YANG_OUTPUT: [u8; 16] = [
+        0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4, 0xc5, 0x5a,
+    ];
+
+    // Test against the step-by-step example detailed in the link below.
+    // Source: http://www.herongyang.com/Cryptography/AES-Example-Vector-of-AES-Encryption.html
+    #[test]
+    fn test_herong_yang_example() {
+        let cipher_key: [UInt8<Fr>; 16] = HERONG_YANG_CIPHERKEY.map(|byte: u8| UInt8::constant(byte));
+        let plaintext: [UInt8<Fr>; 16] = HERONG_YANG_INPUT.map(|byte: u8| UInt8::constant(byte));
+        let round_keys: [[UInt8<Fr>; 4]; NB * (NR + 1)] = Aes128Gadget::aes128_key_schedule(cipher_key);
+        let ciphertext: [UInt8<Fr>; 16] = Aes128Gadget::aes128_encrypt(plaintext, round_keys);
+
+        assert_eq!(HERONG_YANG_OUTPUT, ciphertext.map(|byte| byte.value().unwrap()));
+    }
 
     #[test]
-    #[allow(dead_code, unused_variables)]
-    fn test_basic() {
+    fn test_against_rust_crypto_ase() {
         let rng = &mut test_rng();
 
-        type MyEnc = Aes128;
+        type RustCryptoAes = Aes128;
         type MyGadget = Aes128Gadget<Fr>;
 
         // compute primitive result
-        let parameters = MyEnc::setup(rng).unwrap();
-        let key = MyEnc::keygen(&parameters, rng).unwrap();
+        let parameters = RustCryptoAes::setup(rng).unwrap();
+        let key = RustCryptoAes::keygen(&parameters, rng).unwrap();
         let mut msg = [0u8; 16];
         rng.fill_bytes(&mut msg);
         let randomness = Randomness {};
-        let primitive_result = MyEnc::encrypt(&parameters, &key, &msg, &randomness).unwrap();
+        let primitive_result = RustCryptoAes::encrypt(&parameters, &key, &msg, &randomness).unwrap();
 
         let cs = ConstraintSystem::<Fr>::new_ref();
-
-        println!("key = {:?}", key);
-        println!("msg = {:?}", msg);
-        println!("E(msg, key) = {:?}", primitive_result);
 
         let params_var = ParametersUnitVar::new_constant(ark_relations::ns!(cs, "gadget_parameters"), &parameters).unwrap();
         let msg_var = PlaintextVar::new_witness(ark_relations::ns!(cs, "gadget_message"), || Ok(&msg)).unwrap();
@@ -883,15 +594,13 @@ mod aes_test {
 
         // check that result equals expected ciphertext in the constraint system
         let expected_var =
-            <MyGadget as SymmetricEncryptionGadget<MyEnc, Fr>>::OutputVar::new_input(
+            <MyGadget as SymmetricEncryptionGadget<RustCryptoAes, Fr>>::OutputVar::new_input(
                 ark_relations::ns!(cs, "gadget_expected"),
                 || Ok(&primitive_result),
             )
                 .unwrap();
         expected_var.enforce_equal(&result_var).unwrap();
 
-        // TODO: this test isn't passing yet, which means that there is something wrong in the aes implementation.
-        // TODO: also, ask what an acceptable clock runtime is for this process.
         assert_eq!(primitive_result, result_var.ciphertext.value().unwrap().as_slice());
         assert!(cs.is_satisfied().unwrap());
     }
